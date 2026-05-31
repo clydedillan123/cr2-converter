@@ -1,0 +1,13 @@
+# Railway project — two services with Dockerfiles
+# Docs: https://docs.railway.com/reference/railway-toml
+
+[service.backend]
+path = "backend"
+port = 8000
+
+[service.frontend]
+path = "frontend"
+port = 3000
+
+[service.frontend.env]
+NEXT_PUBLIC_API_URL = "https://{{ services.backend.host }}:8000"
