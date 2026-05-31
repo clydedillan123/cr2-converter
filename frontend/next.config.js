@@ -1,9 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: "standalone",
-  // Backend URL passed at build/runtime via env
-  env: {
-    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000",
+  // Proxy /convert → Python backend (same container, port 8000)
+  async rewrites() {
+    return [
+      {
+        source: "/convert",
+        destination: "http://localhost:8000/convert",
+      },
+    ];
   },
 };
 

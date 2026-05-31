@@ -1,13 +1,5 @@
-# Railway project — two services with Dockerfiles
-# Docs: https://docs.railway.com/reference/railway-toml
+# Railway single-service config — uses root Dockerfile
+# Next.js (port 3000) proxies /convert → Python backend (port 8000) in same container
 
-[service.backend]
-path = "backend"
-port = 8000
-
-[service.frontend]
-path = "frontend"
-port = 3000
-
-[service.frontend.env]
-NEXT_PUBLIC_API_URL = "https://{{ services.backend.host }}:8000"
+[build]
+builder = "dockerfile"

@@ -6,7 +6,7 @@ import { Image, Upload, CheckCircle, XCircle, SpinnerGap } from "@phosphor-icons
 
 type Status = "idle" | "uploading" | "converting" | "done" | "error";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Next.js rewrites proxy /convert → backend (same origin, no CORS)
 
 export function UploadZone() {
   const [status, setStatus] = useState<Status>("idle");
@@ -32,7 +32,7 @@ export function UploadZone() {
 
     try {
       setStatus("converting");
-      const res = await fetch(`${API_URL}/convert`, {
+      const res = await fetch("/convert", {
         method: "POST",
         body: formData,
       });
