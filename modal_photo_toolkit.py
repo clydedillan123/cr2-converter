@@ -164,14 +164,14 @@ def hdr_merge_bytes(files_data: list[bytes], tone_mapper: str = "reinhard") -> b
     if len(files_data) > 7:
         raise ValueError("Maximum 7 exposures")
 
-    # Decode images and convert to float
+    # Decode images as uint8 (required by AlignMTB and CalibrateDebevec)
     images = []
     for data in files_data:
         arr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError("Failed to decode one of the uploaded images")
-        images.append(img.astype(np.float32) / 255.0)
+        images.append(img)
 
     # Resize all images to match the smallest dimensions (alignment needs same size)
     min_h = min(img.shape[0] for img in images)
@@ -182,13 +182,16 @@ def hdr_merge_bytes(files_data: list[bytes], tone_mapper: str = "reinhard") -> b
     align = cv2.createAlignMTB()
     align.process(images, images)
 
+    # Convert to float for HDR processing
+    images_float = [img.astype(np.float32) / 255.0 for img in images]
+
     # Estimate camera response function (Debevec method — robust, widely used)
     calibrate = cv2.createCalibrateDebevec()
     response = calibrate.process(images, np.array([1/len(images)] * len(images), dtype=np.float32))
 
     # Merge exposures into HDR radiance map
     merge = cv2.createMergeDebevec()
-    hdr = merge.process(images, np.array([1/len(images)] * len(images), dtype=np.float32), response)
+    hdr = merge.process(images_float, np.array([1/len(images)] * len(images), dtype=np.float32), response)
 
     # Tone map HDR → LDR
     if tone_mapper == "mantiuk":
