@@ -208,6 +208,67 @@ def hdr_merge_bytes(files_data: list[bytes], tone_mapper: str = "reinhard") -> b
     return encoded.tobytes()
 
 
+def exposure_score_bytes(data: bytes) -> tuple[int, str, float]:
+    """
+    Analyze image exposure via histogram.
+    Returns (score 0–100, grade, mean_brightness 0–255).
+
+    Score ranges:
+      0–30  → dark (underexposed)
+      31–50 → slightly dark
+      51–70 → good exposure
+      71–85 → slightly bright
+      86–100 → blown (overexposed)
+
+    Grade is one of: "dark", "good", "blown"
+    """
+    import cv2
+    import numpy as np
+
+    arr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode image")
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean_brightness = float(np.mean(gray))
+
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    hist = hist.flatten()
+    total = float(np.sum(hist))
+    if total == 0:
+        raise ValueError("Empty image")
+
+    shadows = np.sum(hist[0:64]) / total       # 0–63
+    midtones = np.sum(hist[64:192]) / total     # 64–191
+    highlights = np.sum(hist[192:256]) / total  # 192–255
+
+    # Compute a weighted exposure score
+    # Low mean + high shadows → dark.  High mean + high highlights → blown.
+    # Ideal: bright but not clipped, good midtone presence.
+
+    if mean_brightness < 50 and shadows > 0.6:
+        score = round(max(0, mean_brightness / 50 * 25))
+        grade = "dark"
+    elif mean_brightness > 200 and highlights > 0.4:
+        score = round(85 + min(15, (mean_brightness - 200) / 55 * 15))
+        grade = "blown"
+    elif mean_brightness < 80:
+        score = round(25 + (mean_brightness - 50) / 30 * 25)
+        grade = "dark" if score < 50 else "good"
+    elif mean_brightness > 180:
+        score = round(70 + (mean_brightness - 180) / 75 * 30)
+        grade = "blown" if score > 70 else "good"
+    else:
+        # Well-exposed sweet spot (80–180 mean)
+        # Score penalized by extreme shadow/highlight clipping
+        clip_penalty = max(0, (shadows - 0.3)) * 20 + max(0, (highlights - 0.25)) * 30
+        score = round(max(50, 75 - clip_penalty))
+        grade = "good" if score >= 50 else "dark"
+
+    return score, grade, mean_brightness
+
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 @app.function(
@@ -235,6 +296,7 @@ def web():
             "POST /convert/resize",
             "POST /convert/compress",
             "POST /convert/hdr",
+            "POST /convert/cull",
         ]}
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -502,5 +564,50 @@ def web():
             )
         except Exception as exc:
             return JSONResponse({"error": f"HDR merge failed: {exc}"}, status_code=500)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 7. Exposure Auto-Culler
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @fastapi_app.post("/convert/cull")
+    async def convert_cull(
+        request: Request,
+        files: list[UploadFile] = File(...),
+    ):
+        """Analyze exposure for a batch of images. Returns per-image scores + grades."""
+        client_ip = get_client_ip(request)
+        if not check_rate_limit(client_ip):
+            return rate_limit_response()
+
+        if len(files) == 0:
+            return JSONResponse({"error": "No files provided."}, status_code=400)
+        if len(files) > 30:
+            return JSONResponse({"error": "Maximum 30 files per batch."}, status_code=400)
+
+        results: list[dict] = []
+        for f in files:
+            fname = f.filename or "unknown"
+            try:
+                data = await f.read()
+                score, grade, mean_brightness = exposure_score_bytes(data)
+                results.append({
+                    "filename": fname,
+                    "score": score,
+                    "grade": grade,
+                    "meanBrightness": round(mean_brightness, 1),
+                })
+            except Exception as exc:
+                results.append({"filename": fname, "error": str(exc)})
+
+        # Summary counts
+        blown = sum(1 for r in results if r.get("grade") == "blown")
+        dark = sum(1 for r in results if r.get("grade") == "dark")
+        good = sum(1 for r in results if r.get("grade") == "good")
+        error_count = sum(1 for r in results if "error" in r)
+
+        return JSONResponse({
+            "results": results,
+            "summary": {"blown": blown, "dark": dark, "good": good, "errors": error_count},
+        })
 
     return fastapi_app
