@@ -9,6 +9,7 @@ Endpoints:
   POST /convert/batch     Multiple RAW → zip of JPEGs
   POST /convert/heic      HEIC → JPEG
   POST /convert/avif      AVIF → JPEG
+  POST /convert/avif/batch Multiple AVIF → zip of JPEGs
   POST /convert/resize    JPEG resize (MLS-ready)
   POST /convert/compress  JPEG compressor
   POST /convert/hdr       HDR merge (3–5 bracketed shots → balanced JPEG)
@@ -46,8 +47,9 @@ image = (
         "numpy",
         "exifread",                 # EXIF metadata for bracket organizer (JPEG + RAW)
         "pillow-avif-plugin",       # AVIF decode for the AVIF → JPEG converter
+        "six",                      # py2/3 compat (transitive pin)
     )
-    .env({"TOOLKIT_VERSION": "1.1.3"})
+    .env({"TOOLKIT_VERSION": "1.1.5"})
 )
 
 app = modal.App("photo-toolkit", image=image)
@@ -678,6 +680,7 @@ def web():
             "POST /convert/batch",
             "POST /convert/heic",
             "POST /convert/avif",
+            "POST /convert/avif/batch",
             "POST /convert/resize",
             "POST /convert/compress",
             "POST /convert/hdr",
@@ -871,6 +874,57 @@ def web():
             )
         except Exception as exc:
             return JSONResponse({"error": f"AVIF conversion failed: {exc}"}, status_code=500)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3c. AVIF → JPEG (batch → zip)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @fastapi_app.post("/convert/avif/batch")
+    async def convert_avif_batch(
+        request: Request,
+        files: list[UploadFile] = File(...),
+        quality: int = 92,
+    ):
+        """Convert multiple AVIF files → zip of JPEGs. Max 20 files."""
+        client_ip = get_client_ip(request)
+        # Batch counts as 1 conversion against the rate limit
+        if not check_rate_limit(client_ip):
+            return rate_limit_response()
+
+        if len(files) == 0:
+            return JSONResponse({"error": "No files provided."}, status_code=400)
+        if len(files) > 20:
+            return JSONResponse({"error": "Maximum 20 files per batch."}, status_code=400)
+
+        quality = clamp_quality(quality)
+        zip_buf = io.BytesIO()
+        results: list[dict] = []
+
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                fname = f.filename or "image.avif"
+                ext = Path(fname).suffix.lower()
+                if ext not in {".avif", ".avifs"}:
+                    results.append({"filename": fname, "error": f"Unsupported format: {ext}"})
+                    continue
+                try:
+                    data = await f.read()
+                    jpeg_data = avif_to_jpeg_bytes(data, quality)
+                    out_name = Path(fname).stem + ".jpg"
+                    zf.writestr(out_name, jpeg_data)
+                    results.append({"filename": out_name, "status": "ok"})
+                except Exception as exc:
+                    results.append({"filename": fname, "error": str(exc)})
+
+        zip_buf.seek(0)
+        return Response(
+            content=zip_buf.getvalue(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": 'attachment; filename="avif_batch.zip"',
+                "X-Results": str(results),
+            },
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. MLS Resizer
