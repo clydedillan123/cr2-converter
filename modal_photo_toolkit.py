@@ -8,6 +8,7 @@ Endpoints:
   POST /convert/raw       Universal RAW → JPEG  (CR2, NEF, ARW, DNG, RAF, ORF, RW2)
   POST /convert/batch     Multiple RAW → zip of JPEGs
   POST /convert/heic      HEIC → JPEG
+  POST /convert/avif      AVIF → JPEG
   POST /convert/resize    JPEG resize (MLS-ready)
   POST /convert/compress  JPEG compressor
   POST /convert/hdr       HDR merge (3–5 bracketed shots → balanced JPEG)
@@ -44,8 +45,9 @@ image = (
         "opencv-python-headless",   # HDR merge + image alignment
         "numpy",
         "exifread",                 # EXIF metadata for bracket organizer (JPEG + RAW)
+        "pillow-avif-plugin",       # AVIF decode for the AVIF → JPEG converter
     )
-    .env({"TOOLKIT_VERSION": "1.1.2"})
+    .env({"TOOLKIT_VERSION": "1.1.3"})
 )
 
 app = modal.App("photo-toolkit", image=image)
@@ -111,6 +113,20 @@ def heic_to_jpeg_bytes(data: bytes, quality: int = 92) -> bytes:
     # pillow-heif registers itself as a Pillow plugin on import
     import pillow_heif
     pillow_heif.register_heif_opener()
+
+    img = Image.open(io.BytesIO(data))
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def avif_to_jpeg_bytes(data: bytes, quality: int = 92) -> bytes:
+    """Decode AVIF → JPEG bytes."""
+    from PIL import Image
+    import pillow_avif  # noqa: F401 — registers AVIF support with Pillow
 
     img = Image.open(io.BytesIO(data))
     if img.mode in ("RGBA", "LA", "P"):
@@ -661,6 +677,7 @@ def web():
             "POST /convert/raw",
             "POST /convert/batch",
             "POST /convert/heic",
+            "POST /convert/avif",
             "POST /convert/resize",
             "POST /convert/compress",
             "POST /convert/hdr",
@@ -815,6 +832,45 @@ def web():
             )
         except Exception as exc:
             return JSONResponse({"error": f"HEIC conversion failed: {exc}"}, status_code=500)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3b. AVIF → JPEG
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @fastapi_app.post("/convert/avif")
+    async def convert_avif(request: Request, file: UploadFile = File(...), quality: int = 92):
+        """Convert AVIF/AVIFS to JPEG."""
+        client_ip = get_client_ip(request)
+        if not check_rate_limit(client_ip):
+            return rate_limit_response()
+
+        filename = file.filename or "image.avif"
+        ext = Path(filename).suffix.lower()
+        if ext not in {".avif", ".avifs"}:
+            return JSONResponse(
+                {"error": f"Expected .AVIF file, got '{ext}'"},
+                status_code=400,
+            )
+
+        quality = clamp_quality(quality)
+        data = await file.read()
+
+        try:
+            jpeg_data = avif_to_jpeg_bytes(data, quality)
+            out_name = Path(filename).stem + ".jpg"
+
+            return Response(
+                content=jpeg_data,
+                media_type="image/jpeg",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{out_name}"',
+                    "X-Conversion-Quality": str(quality),
+                    "X-Original-Size": str(len(data)),
+                    "X-New-Size": str(len(jpeg_data)),
+                },
+            )
+        except Exception as exc:
+            return JSONResponse({"error": f"AVIF conversion failed: {exc}"}, status_code=500)
 
     # ═══════════════════════════════════════════════════════════════════════
     # 4. MLS Resizer
