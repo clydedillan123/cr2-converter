@@ -1,7 +1,7 @@
 """
 Photo Toolkit — Modal Serverless Endpoint
 ==========================================
-Five free tools for real estate photographers, all running on Modal.
+Free tools for real estate photographers, all running on Modal.
 
 Deploy:  modal deploy modal_photo_toolkit.py
 Endpoints:
@@ -11,6 +11,8 @@ Endpoints:
   POST /convert/resize    JPEG resize (MLS-ready)
   POST /convert/compress  JPEG compressor
   POST /convert/hdr       HDR merge (3–5 bracketed shots → balanced JPEG)
+  POST /convert/cull      Exposure auto-culler (histogram analysis per frame)
+  POST /organize/brackets Group + validate HDR bracket sets (EXIF-only, no decode)
 
 Free tier: 10 conversions/hour/IP across all endpoints.
 """
@@ -40,6 +42,7 @@ image = (
         "pillow-heif",              # HEIC/HEIF support for Pillow
         "opencv-python-headless",   # HDR merge + image alignment
         "numpy",
+        "exifread",                 # EXIF metadata for bracket organizer (JPEG + RAW)
     )
 )
 
@@ -269,6 +272,263 @@ def exposure_score_bytes(data: bytes) -> tuple[int, str, float]:
     return score, grade, mean_brightness
 
 
+# ── Bracket organizer helpers ────────────────────────────────────────────────
+# EXIF-only: groups bracketed exposures into sets and validates each set.
+# No full RAW decode — reads metadata via exifread (works on JPEG + most RAW).
+
+def _first_val(tag):
+    """Return the first value of an exifread tag, or None."""
+    if tag is None:
+        return None
+    vals = getattr(tag, "values", None)
+    if vals is None:
+        return None
+    if isinstance(vals, (list, tuple)):
+        return vals[0] if vals else None
+    return vals
+
+
+def _tag_num(tags, *names):
+    """First numeric value found under any of the named EXIF tags."""
+    from fractions import Fraction
+    for n in names:
+        v = _first_val(tags.get(n))
+        if v is None:
+            continue
+        if isinstance(v, Fraction):
+            return float(v)
+        if isinstance(v, (int, float)):
+            return float(v)
+        if hasattr(v, "numerator") and hasattr(v, "denominator") and v.denominator:
+            return float(v.numerator) / float(v.denominator)
+        if isinstance(v, str):
+            s = v.strip()
+            if "/" in s:
+                a, b = s.split("/", 1)
+                try:
+                    return float(a) / float(b)
+                except ValueError:
+                    return None
+            try:
+                return float(s)
+            except ValueError:
+                return None
+    return None
+
+
+def _tag_str(tags, *names):
+    """First string value found under any of the named EXIF tags."""
+    for n in names:
+        v = _first_val(tags.get(n))
+        if v is None:
+            continue
+        if isinstance(v, str):
+            return v.strip()
+        return str(v)
+    return None
+
+
+def read_exif(data: bytes) -> dict | None:
+    """
+    Read bracket-relevant EXIF from image bytes.
+    Works on JPEG/TIFF/RAW via exifread; falls back to Pillow for the
+    capture timestamp on JPEG/TIFF. Returns None when nothing is readable.
+    """
+    import exifread
+    from datetime import datetime
+
+    tags = {}
+    try:
+        with io.BytesIO(data) as f:
+            tags = exifread.process_file(f, details=False) or {}
+    except Exception:
+        tags = {}
+
+    dt_str = _tag_str(tags, "EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime")
+    timestamp = None
+    if dt_str:
+        try:
+            timestamp = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            timestamp = None
+
+    # Pillow fallback for timestamp (JPEG/TIFF) when exifread found nothing
+    if timestamp is None:
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(data))
+            exif = img.getexif() if hasattr(img, "getexif") else None
+            if exif:
+                s = exif.get(36867) or exif.get(306)  # DateTimeOriginal / DateTime
+                if s:
+                    try:
+                        timestamp = datetime.strptime(s, "%Y:%m:%d %H:%M:%S")
+                    except ValueError:
+                        timestamp = None
+        except Exception:
+            pass
+
+    if timestamp is None and not tags:
+        return None
+
+    ev = _tag_num(tags, "EXIF ExposureCompensation", "EXIF ExposureBiasValue")
+    iso = _tag_num(tags, "EXIF ISOSpeedRatings", "EXIF PhotographicSensitivity", "Image ISOSpeedRatings")
+    aperture = _tag_num(tags, "EXIF FNumber", "EXIF ApertureValue")
+    focal = _tag_num(tags, "EXIF FocalLength")
+    exposure_time = _tag_num(tags, "EXIF ExposureTime")
+
+    shutter = None
+    if exposure_time is not None:
+        from fractions import Fraction
+        fr = Fraction(exposure_time).limit_denominator(1_000_000)
+        shutter = f"{fr.numerator}s" if fr.denominator == 1 else f"{fr.numerator}/{fr.denominator}s"
+
+    return {
+        "timestamp": timestamp,
+        "ev": ev,
+        "iso": int(iso) if iso is not None else None,
+        "aperture": aperture,
+        "focal": focal,
+        "shutter": shutter,
+    }
+
+
+def _drift_issue(frames: list[dict], field: str, label: str, fmt) -> str | None:
+    """Return an issue string if a setting changed within the set, else None."""
+    vals = [f["exif"][field] for f in frames if f["exif"] and f["exif"][field] is not None]
+    uniq = sorted(set(round(v, 2) for v in vals))
+    if len(uniq) > 1:
+        return f"{label} changed within set (" + " → ".join(fmt(v) for v in uniq) + ")"
+    return None
+
+
+def organize_brackets(metas: list[dict], gap_seconds: float = 2.0) -> dict:
+    """
+    Group bracketed exposures by capture-time gap, then validate each set.
+    `metas`: [{"filename": str, "exif": dict | None}].
+    """
+    from datetime import datetime
+
+    known = [m for m in metas if m["exif"] and m["exif"]["timestamp"]]
+    no_exif = [{"filename": m["filename"]} for m in metas if not (m["exif"] and m["exif"]["timestamp"])]
+    known.sort(key=lambda m: m["exif"]["timestamp"])
+
+    groups_raw: list[list[dict]] = []
+    singles: list[dict] = []
+    current: list[dict] = []
+
+    for m in known:
+        if not current:
+            current = [m]
+            continue
+        gap = (m["exif"]["timestamp"] - current[-1]["exif"]["timestamp"]).total_seconds()
+        if gap <= gap_seconds:
+            current.append(m)
+        else:
+            if len(current) >= 2:
+                groups_raw.append(current)
+            else:
+                singles.append(current[0])
+            current = [m]
+    if current:
+        if len(current) >= 2:
+            groups_raw.append(current)
+        else:
+            singles.append(current[0])
+
+    groups_out = []
+    valid_count = 0
+    flagged_count = 0
+
+    for i, frames in enumerate(groups_raw):
+        label = f"Bracket {chr(ord('A') + i)}" if i < 26 else f"Bracket {i + 1}"
+        # Order by EV ascending (None last); fallback keeps capture order.
+        frames_sorted = sorted(
+            frames,
+            key=lambda m: (m["exif"]["ev"] is None, m["exif"]["ev"] if m["exif"]["ev"] is not None else float("inf")),
+        )
+        issues: list[str] = []
+        count = len(frames_sorted)
+
+        if count not in (3, 5, 7):
+            issues.append(f"Incomplete bracket set — {count} frames (expected 3, 5, or 7)")
+
+        evs = [f["exif"]["ev"] for f in frames_sorted if f["exif"]["ev"] is not None]
+        # Duplicate exposures
+        seen: dict[float, int] = {}
+        for e in evs:
+            seen[e] = seen.get(e, 0) + 1
+        dups = [e for e, c in seen.items() if c > 1]
+        if dups:
+            issues.append("Duplicate exposure (" + ", ".join(f"EV {_ev_str(e)}" for e in dups) + ")")
+
+        # Missing intermediate exposures (only meaningful for monotonic EV runs)
+        if len(evs) >= 3:
+            sev = sorted(evs)
+            diffs = [sev[j + 1] - sev[j] for j in range(len(sev) - 1)]
+            pos = [d for d in diffs if d > 0]
+            if pos:
+                step = sum(pos) / len(pos)
+                missing_at = [sev[j + 1] for j, d in enumerate(diffs) if d > step * 1.6 and d > 0.5]
+                if missing_at:
+                    issues.append("Possible missing exposure near EV " + ", ".join(_ev_str(m) for m in missing_at))
+
+        # Drift in aperture / ISO / focal length
+        for field, lbl, fmt in (
+            ("aperture", "Aperture", lambda v: f"f/{v:g}"),
+            ("iso", "ISO", lambda v: f"{int(v)}"),
+            ("focal", "Focal length", lambda v: f"{v:g}mm"),
+        ):
+            issue = _drift_issue(frames_sorted, field, lbl, fmt)
+            if issue:
+                issues.append(issue)
+
+        valid = not issues
+        if valid:
+            valid_count += 1
+        else:
+            flagged_count += 1
+
+        t0 = frames_sorted[0]["exif"]["timestamp"]
+        tN = frames_sorted[-1]["exif"]["timestamp"]
+        groups_out.append({
+            "label": label,
+            "valid": valid,
+            "count": count,
+            "start_time": t0.isoformat(),
+            "end_time": tN.isoformat(),
+            "span_seconds": round((tN - t0).total_seconds(), 2),
+            "issues": issues,
+            "frames": [{
+                "filename": f["filename"],
+                "ev": f["exif"]["ev"],
+                "shutter": f["exif"]["shutter"],
+                "iso": f["exif"]["iso"],
+                "aperture": f["exif"]["aperture"],
+                "focal": f["exif"]["focal"],
+                "timestamp": f["exif"]["timestamp"].isoformat(),
+            } for f in frames_sorted],
+        })
+
+    return {
+        "groups": groups_out,
+        "singles": [{"filename": s["filename"], "timestamp": s["exif"]["timestamp"].isoformat()} for s in singles],
+        "no_exif": no_exif,
+        "summary": {
+            "total_sets": len(groups_out),
+            "valid_sets": valid_count,
+            "flagged_sets": flagged_count,
+            "singles": len(singles),
+            "no_exif": len(no_exif),
+            "total_files": len(metas),
+        },
+    }
+
+
+def _ev_str(v: float) -> str:
+    return f"{'+' if v >= 0 else ''}{v:g}"
+
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 @app.function(
@@ -297,6 +557,7 @@ def web():
             "POST /convert/compress",
             "POST /convert/hdr",
             "POST /convert/cull",
+            "POST /organize/brackets",
         ]}
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -609,5 +870,44 @@ def web():
             "results": results,
             "summary": {"blown": blown, "dark": dark, "good": good, "errors": error_count},
         })
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 8. HDR Bracket Organizer & Validator
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @fastapi_app.post("/organize/brackets")
+    async def organize_brackets_ep(
+        request: Request,
+        files: list[UploadFile] = File(...),
+        gap: float = Form(2.0),
+    ):
+        """Group bracketed exposures into sets and validate each set (EXIF-only)."""
+        client_ip = get_client_ip(request)
+        if not check_rate_limit(client_ip):
+            return rate_limit_response()
+
+        if len(files) == 0:
+            return JSONResponse({"error": "No files provided."}, status_code=400)
+        if len(files) > 60:
+            return JSONResponse({"error": "Maximum 60 files per batch."}, status_code=400)
+
+        gap = max(1.0, min(5.0, float(gap)))
+
+        metas = []
+        for f in files:
+            fname = f.filename or "image"
+            try:
+                data = await f.read()
+                exif = read_exif(data)
+            except Exception:
+                exif = None
+            metas.append({"filename": fname, "exif": exif})
+
+        try:
+            result = organize_brackets(metas, gap)
+        except Exception as exc:
+            return JSONResponse({"error": f"Organize failed: {exc}"}, status_code=500)
+
+        return JSONResponse(result)
 
     return fastapi_app
