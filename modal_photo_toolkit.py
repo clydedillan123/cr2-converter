@@ -13,6 +13,7 @@ Endpoints:
   POST /convert/hdr       HDR merge (3–5 bracketed shots → balanced JPEG)
   POST /convert/cull      Exposure auto-culler (histogram analysis per frame)
   POST /organize/brackets Group + validate HDR bracket sets (EXIF-only, no decode)
+  POST /inspect/mls       MLS preflight compliance check (dimensions, sRGB, GPS, etc.)
 
 Free tier: 10 conversions/hour/IP across all endpoints.
 """
@@ -44,6 +45,7 @@ image = (
         "numpy",
         "exifread",                 # EXIF metadata for bracket organizer (JPEG + RAW)
     )
+    .env({"TOOLKIT_VERSION": "1.1.2"})
 )
 
 app = modal.App("photo-toolkit", image=image)
@@ -529,6 +531,112 @@ def _ev_str(v: float) -> str:
     return f"{'+' if v >= 0 else ''}{v:g}"
 
 
+def _form_bool(v) -> bool:
+    """Parse a multipart form value into a bool (robust across 'true'/'1'/'yes')."""
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ── MLS preflight inspection ─────────────────────────────────────────────────
+# Deterministic, server-side compliance checks. No watermark/staging detection
+# (not reliably solvable) — only measurable technical properties.
+
+def inspect_image(data: bytes, filename: str, req: dict) -> dict:
+    """Inspect one image against MLS-style technical requirements."""
+    from PIL import Image
+
+    file_kb = round(len(data) / 1024, 1)
+    issues: list[str] = []
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception as exc:
+        return {
+            "filename": filename, "error": f"Unreadable: {exc}",
+            "issues": ["Unreadable image"], "passed": False, "needs_correction": False,
+        }
+
+    w, h = img.size
+    aspect = round(w / h, 3) if h else 0
+    fmt = (img.format or "").upper()
+
+    # sRGB detection via ICC profile name (ImageCms); None when no profile embedded
+    icc = img.info.get("icc_profile")
+    srgb = None
+    if icc:
+        try:
+            from PIL import ImageCms
+            name = ImageCms.getProfileName(ImageCms.ImageCmsProfile(io.BytesIO(icc)))
+            srgb = "srgb" in (name or "").lower()
+        except Exception:
+            srgb = False
+
+    # Orientation
+    exif = img.getexif() if hasattr(img, "getexif") else None
+    orientation = exif.get(274) if exif else None
+
+    # GPS — try Pillow, then fall back to exifread (belt and suspenders)
+    has_gps = False
+    if exif:
+        try:
+            has_gps = bool(exif.get_ifd(0x8825)) or (34853 in exif)
+        except Exception:
+            has_gps = 34853 in exif
+    if not has_gps:
+        try:
+            import exifread as _exr
+            with io.BytesIO(data) as _fh:
+                _tags = _exr.process_file(_fh, details=False) or {}
+            has_gps = any(k.startswith("GPS") for k in _tags)
+        except Exception:
+            pass
+
+    # Compression heuristic (bytes per pixel)
+    bpp = len(data) / (w * h) if w and h else 0
+
+    # Exposure (reuse histogram grade)
+    grade = None
+    try:
+        _score, grade, _mean = exposure_score_bytes(data)
+    except Exception:
+        grade = None
+
+    # ── evaluate against requirements ──
+    max_edge = req.get("max_edge")
+    if max_edge and max(w, h) > max_edge:
+        issues.append(f"Over max size ({max(w, h)}px > {max_edge}px)")
+    max_file_mb = req.get("max_file_mb")
+    if max_file_mb and (len(data) / (1024 * 1024)) > max_file_mb:
+        issues.append(f"File too large ({file_kb} KB > {max_file_mb} MB)")
+    if req.get("require_jpeg") and fmt != "JPEG":
+        issues.append(f"Not JPEG ({fmt})")
+    if req.get("require_srgb") and srgb is False:
+        issues.append("Not sRGB colour profile")
+    if req.get("require_no_gps") and has_gps:
+        issues.append("GPS metadata present")
+    if orientation and orientation != 1:
+        issues.append(f"Orientation tag set ({orientation}) — auto-fixed on export")
+
+    needs_correction = grade in ("dark", "blown") if grade else False
+
+    return {
+        "filename": filename,
+        "width": w,
+        "height": h,
+        "aspect": aspect,
+        "file_kb": file_kb,
+        "format": fmt,
+        "srgb": srgb,            # True / False / None
+        "orientation": orientation,
+        "has_gps": has_gps,
+        "bpp": round(bpp, 3),
+        "exposure": grade,       # "good" / "dark" / "blown" / None
+        "needs_correction": needs_correction,
+        "issues": issues,
+        "passed": len(issues) == 0,
+    }
+
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 @app.function(
@@ -558,6 +666,7 @@ def web():
             "POST /convert/hdr",
             "POST /convert/cull",
             "POST /organize/brackets",
+            "POST /inspect/mls",
         ]}
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -909,5 +1018,90 @@ def web():
             return JSONResponse({"error": f"Organize failed: {exc}"}, status_code=500)
 
         return JSONResponse(result)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 9. MLS Preflight Inspector
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @fastapi_app.post("/inspect/mls")
+    async def inspect_mls(
+        request: Request,
+        files: list[UploadFile] = File(...),
+        max_edge: int = Form(2048),
+        max_file_mb: float = Form(5.0),
+        require_srgb: str = Form("true"),
+        require_jpeg: str = Form("true"),
+        require_no_gps: str = Form("true"),
+        require_sequential: str = Form("true"),
+    ):
+        """Inspect a folder against MLS-style technical requirements."""
+        import re
+
+        client_ip = get_client_ip(request)
+        if not check_rate_limit(client_ip):
+            return rate_limit_response()
+
+        if len(files) == 0:
+            return JSONResponse({"error": "No files provided."}, status_code=400)
+        if len(files) > 30:
+            return JSONResponse({"error": "Maximum 30 files per batch."}, status_code=400)
+
+        req = {
+            "max_edge": max(200, min(8192, int(max_edge))),
+            "max_file_mb": max(0.1, float(max_file_mb)),
+            "require_srgb": _form_bool(require_srgb),
+            "require_jpeg": _form_bool(require_jpeg),
+            "require_no_gps": _form_bool(require_no_gps),
+            "require_sequential": _form_bool(require_sequential),
+        }
+
+        results: list[dict] = []
+        for f in files:
+            fname = f.filename or "image"
+            try:
+                data = await f.read()
+                results.append(inspect_image(data, fname, req))
+            except Exception as exc:
+                results.append({
+                    "filename": fname, "error": str(exc),
+                    "issues": ["Inspection failed"], "passed": False, "needs_correction": False,
+                })
+
+        # Sequential naming check (folder-level)
+        naming = {"ok": True, "notes": []}
+        if req["require_sequential"]:
+            nums = []
+            for r in results:
+                m = re.search(r"(\d+)", r.get("filename", ""))
+                if m:
+                    nums.append(int(m.group(1)))
+            if nums:
+                dup = sorted({n for n in nums if nums.count(n) > 1})
+                present = set(nums)
+                missing = [n for n in range(min(nums), max(nums) + 1) if n not in present]
+                if dup:
+                    naming["notes"].append("Duplicate numbers: " + ", ".join(map(str, dup)))
+                if missing:
+                    naming["notes"].append("Missing numbers: " + ", ".join(map(str, missing)))
+                if dup or missing:
+                    naming["ok"] = False
+            else:
+                naming["notes"].append("No numeric pattern found in filenames")
+
+        passed = sum(1 for r in results if r.get("passed") and not r.get("error"))
+        failed = len(results) - passed
+        needs_correction = sum(1 for r in results if r.get("needs_correction"))
+
+        return JSONResponse({
+            "results": results,
+            "naming": naming,
+            "requirements": req,
+            "summary": {
+                "total": len(results),
+                "passed": passed,
+                "failed": failed,
+                "needs_correction": needs_correction,
+            },
+        })
 
     return fastapi_app
