@@ -226,16 +226,63 @@ def hdr_merge_bytes(files_data: list[bytes], tone_mapper: str = "reinhard") -> t
         print(f"[hdr] Mertens exception: {exc}")
 
     if fused is None:
-        sigma = 0.2
-        weights = [np.exp(-0.5 * ((img - 0.5) ** 2) / (sigma ** 2)) for img in images_float]
-        weight_sum = np.maximum(sum(weights), 1e-10)
-        fused = sum(w * img for w, img in zip(weights, images_float)) / weight_sum
-        fused = np.clip(fused, 0.0, 1.0).astype(np.float32)
+        print("[hdr] manual fusion sigma=0.12 pyramid")
 
-    contrast = 1.08
+        weights = []
+        for img in images_float:
+            gray = 0.114 * img[..., 0] + 0.587 * img[..., 1] + 0.299 * img[..., 2]
+            contrast = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+            sat = np.std(img, axis=2)
+            sigma = 0.12
+            exp_w = np.prod(np.exp(-0.5 * ((img - 0.5) ** 2) / (sigma ** 2)), axis=2)
+            w = (contrast + 1e-3) * (sat + 1e-3) * (exp_w + 1e-3)
+            weights.append(w)
+
+        weight_sum = np.maximum(sum(weights), 1e-10)
+        norm_weights = [w / weight_sum for w in weights]
+
+        levels = min(5, max(1, int(np.log2(min(min_h, min_w))) - 1))
+
+        def _laplacian_pyramid(img, levels):
+            gp = [img]
+            for _ in range(levels):
+                gp.append(cv2.pyrDown(gp[-1]))
+            lp = [gp[-1]]
+            for i in range(levels, 0, -1):
+                size = (gp[i - 1].shape[1], gp[i - 1].shape[0])
+                lp.append(gp[i - 1] - cv2.pyrUp(gp[i], dstsize=size))
+            return lp
+
+        def _gaussian_pyramid(img, levels):
+            gp = [img]
+            for _ in range(levels):
+                gp.append(cv2.pyrDown(gp[-1]))
+            return list(reversed(gp))
+
+        img_lps = [_laplacian_pyramid(img, levels) for img in images_float]
+        wts_gps = [_gaussian_pyramid(np.repeat(w[..., None], 3, axis=2), levels) for w in norm_weights]
+
+        blended_lp = []
+        for level in range(levels + 1):
+            blended_lp.append(sum(wg[level] * il[level] for wg, il in zip(wts_gps, img_lps)))
+
+        fused = blended_lp[0]
+        for i in range(1, levels + 1):
+            size = (blended_lp[i].shape[1], blended_lp[i].shape[0])
+            fused = cv2.pyrUp(fused, dstsize=size) + blended_lp[i]
+
+        fused = np.clip(fused, 0.0, 1.0).astype(np.float32)
+        print(f"[hdr] pre-postprocess: min={float(np.nanmin(fused)):.4f} max={float(np.nanmax(fused)):.4f} mean={float(np.nanmean(fused)):.4f}")
+
+    contrast = 1.2
     fused = np.clip((fused - 0.5) * contrast + 0.5, 0.0, 1.0)
 
-    sat = 1.12
+    gray_2d = 0.114 * fused[..., 0] + 0.587 * fused[..., 1] + 0.299 * fused[..., 2]
+    blurred = cv2.GaussianBlur(gray_2d, (0, 0), sigmaX=3)
+    clarity = 0.3
+    fused = np.clip(fused + clarity * (gray_2d - blurred)[..., None], 0.0, 1.0)
+
+    sat = 1.3
     gray = (0.114 * fused[..., 0] + 0.587 * fused[..., 1] + 0.299 * fused[..., 2])[..., None]
     fused = np.clip(gray + (fused - gray) * sat, 0.0, 1.0)
 
