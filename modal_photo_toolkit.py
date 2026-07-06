@@ -174,10 +174,16 @@ def compress_jpeg_bytes(data: bytes, quality: int = 70) -> bytes:
     return buf.getvalue()
 
 
-def hdr_merge_bytes(files_data: list[bytes], tone_mapper: str = "reinhard") -> bytes:
+def hdr_merge_bytes(files_data: list[bytes], tone_mapper: str = "reinhard") -> tuple[bytes, str]:
     """
     Merge 3–5 bracketed exposures into a balanced HDR JPEG.
-    Uses OpenCV: align → estimate CRF → merge → tone map → encode.
+
+    Tries OpenCV Mertens exposure fusion first. If Mertens returns near-zero
+    output (a known regression in some opencv-python-headless builds), falls
+    back to a manual well-exposedness-weighted average — less sophisticated
+    but always produces a valid, balanced image.
+
+    Returns (jpeg_bytes, method) where method is "mertens" or "manual".
     """
     import cv2
     import numpy as np
@@ -187,48 +193,60 @@ def hdr_merge_bytes(files_data: list[bytes], tone_mapper: str = "reinhard") -> b
     if len(files_data) > 7:
         raise ValueError("Maximum 7 exposures")
 
-    # Decode images
-    images = []
+    images: list[np.ndarray] = []
     for data in files_data:
         arr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError("Failed to decode one of the uploaded images")
-        # Ensure 3-channel BGR
         if len(img.shape) == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif img.shape[2] == 4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         images.append(img)
 
-    # Resize all images to match the smallest dimensions
     min_h = min(img.shape[0] for img in images)
     min_w = min(img.shape[1] for img in images)
     images = [cv2.resize(img, (min_w, min_h)) for img in images]
 
-    # Convert to float for HDR merge
-    images_float = [img.astype(np.float32) / 255.0 for img in images]
+    images_float = [np.ascontiguousarray(img.astype(np.float32) / 255.0) for img in images]
 
-    # Merge exposures with Mertens (no calibration or alignment needed)
-    merge = cv2.createMergeMertens()
-    hdr = merge.process(images_float)
+    fused = None
+    method = "manual"
 
-    # Tone map HDR → LDR
-    if tone_mapper == "mantiuk":
-        tonemap = cv2.createTonemapMantiuk(gamma=1.0, scale=0.85, saturation=1.2)
-    else:
-        # Reinhard — natural, realistic look (default for real estate)
-        tonemap = cv2.createTonemapReinhard(gamma=1.0, intensity=0.0, light_adapt=1.0, color_adapt=0.0)
+    try:
+        merge = cv2.createMergeMertens(1.0, 1.0, 1.0)
+        candidate = merge.process(images_float)
+        if candidate is not None and float(np.nanmax(candidate)) >= 0.01:
+            fused = candidate
+            method = "mertens"
+        else:
+            print(f"[hdr] Mertens near-zero: max={float(np.nanmax(candidate)) if candidate is not None else 'None'}")
+    except Exception as exc:
+        print(f"[hdr] Mertens exception: {exc}")
 
-    ldr = tonemap.process(hdr)
+    if fused is None:
+        sigma = 0.2
+        weights = [np.exp(-0.5 * ((img - 0.5) ** 2) / (sigma ** 2)) for img in images_float]
+        weight_sum = np.maximum(sum(weights), 1e-10)
+        fused = sum(w * img for w, img in zip(weights, images_float)) / weight_sum
+        fused = np.clip(fused, 0.0, 1.0).astype(np.float32)
 
-    # Convert to 8-bit and encode as JPEG
-    ldr_8bit = np.clip(ldr * 255, 0, 255).astype(np.uint8)
+    contrast = 1.08
+    fused = np.clip((fused - 0.5) * contrast + 0.5, 0.0, 1.0)
+
+    sat = 1.12
+    gray = (0.114 * fused[..., 0] + 0.587 * fused[..., 1] + 0.299 * fused[..., 2])[..., None]
+    fused = np.clip(gray + (fused - gray) * sat, 0.0, 1.0)
+
+    ldr_8bit = np.clip(fused * 255, 0, 255).astype(np.uint8)
+    print(f"[hdr] {method} out: min={int(np.nanmin(ldr_8bit))} max={int(np.nanmax(ldr_8bit))} mean={float(np.nanmean(ldr_8bit)):.1f}")
+
     success, encoded = cv2.imencode(".jpg", ldr_8bit, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if not success:
         raise ValueError("Failed to encode HDR result")
 
-    return encoded.tobytes()
+    return encoded.tobytes(), method
 
 
 def exposure_score_bytes(data: bytes) -> tuple[int, str, float]:
@@ -1031,7 +1049,7 @@ def web():
             # Read all files into memory
             data = [await f.read() for f in files]
 
-            merged = hdr_merge_bytes(data, tone)
+            merged, method = hdr_merge_bytes(data, tone)
 
             return Response(
                 content=merged,
@@ -1040,6 +1058,7 @@ def web():
                     "Content-Disposition": 'attachment; filename="hdr_merged.jpg"',
                     "X-Tone-Mapper": tone,
                     "X-Exposures-Merged": str(len(files)),
+                    "X-HDR-Method": method,
                 },
             )
         except Exception as exc:
@@ -1182,18 +1201,36 @@ def web():
         if req["require_sequential"]:
             nums = []
             for r in results:
-                m = re.search(r"(\d+)", r.get("filename", ""))
-                if m:
-                    nums.append(int(m.group(1)))
+                # Use the LAST run of digits — sequence numbers usually sit at
+                # the end of a name (e.g. "2024_03_15_001.jpg" → 1), not inside
+                # a year/timestamp prefix.
+                hits = re.findall(r"(\d+)", r.get("filename", ""))
+                if hits:
+                    nums.append(int(hits[-1]))
             if nums:
                 dup = sorted({n for n in nums if nums.count(n) > 1})
                 present = set(nums)
-                missing = [n for n in range(min(nums), max(nums) + 1) if n not in present]
+                lo, hi = min(nums), max(nums)
+                missing = [n for n in range(lo, hi + 1) if n not in present]
+                # Only enumerate gaps when they're small relative to the file
+                # count. If the span dwarfs the number of files (camera roll
+                # IDs, timestamps, years), the numbers were never meant to be
+                # contiguous from lo→hi — listing thousands of "missing"
+                # numbers is noise, so summarize instead.
+                non_contiguous = missing and len(missing) > len(nums)
+                if non_contiguous:
+                    missing = []
+                    naming["notes"].append(
+                        f"Non-sequential numbering (IDs span {lo}–{hi}); rename to 1…N if your board requires a contiguous sequence"
+                    )
                 if dup:
                     naming["notes"].append("Duplicate numbers: " + ", ".join(map(str, dup)))
                 if missing:
-                    naming["notes"].append("Missing numbers: " + ", ".join(map(str, missing)))
-                if dup or missing:
+                    cap = 50
+                    shown = missing[:cap]
+                    suffix = f" …and {len(missing) - cap} more" if len(missing) > cap else ""
+                    naming["notes"].append("Missing numbers: " + ", ".join(map(str, shown)) + suffix)
+                if dup or missing or non_contiguous:
                     naming["ok"] = False
             else:
                 naming["notes"].append("No numeric pattern found in filenames")
